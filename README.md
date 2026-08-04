@@ -104,9 +104,5 @@ GROQ_API_KEY=your-groq-key   # or run Ollama locally instead
 | POST | `/ask` | Natural-language Q&A over monitoring history (RAG) |
 
 Background task: a scheduled loop re-checks all URLs every 30 seconds automatically via FastAPI's `lifespan` startup hook and `asyncio.create_task`.
-
-## What I'd add next
-- WebSocket push instead of polling for live dashboard updates
-- Response-time chart in the history view (Recharts)
-- Refresh tokens for shorter-lived access tokens
+ived access tokens
 - Rate limiting on `/ask` to control LLM call volume
