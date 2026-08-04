@@ -9,6 +9,7 @@ class Website(Base):
     url = Column(String(255), unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     checks = relationship("Check", back_populates="website")
+    owner_id = Column(Integer, ForeignKey("users.id"))
 
 class Check(Base):
     __tablename__ = "Checks"
@@ -20,4 +21,8 @@ class Check(Base):
     checked_at = Column(DateTime, default=datetime.utcnow)
     website = relationship("Website", back_populates="checks")
 
-
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    email = Column(String, unique=True, nullable=False)
+    hashed_password = Column(String, nullable=False)

@@ -2,20 +2,17 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from database import AsyncSessionLocal, engine, Base
-import model, schemas, checker
+from database import AsyncSessionLocal, engine, Base, get_db
+import model, schemas, checker, auth
 from datetime import datetime
 import time
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import oauth2, OAuth2PasswordRequestForm
+from auth import get_current_user, pwd_context, create_access_token
 
 background_task = None
-
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
-
 
 async def periodic_checker():
     while True:
@@ -64,20 +61,21 @@ app.add_middleware(
 )
 
 @app.post("/websites", response_model= schemas.WebsiteOut)
-async def add_website(website: schemas.WebsiteCreate, db: AsyncSession = Depends(get_db)):
+async def add_website(website: schemas.WebsiteCreate, db: AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
     result = await db.execute(select(model.Website).where(model.Website.url==str(website.url)))
     existing = result.scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=400, detail="Url already being monitored")
     
-    db_website = model.Website(url=str(website.url))
+    db_website = model.Website(url=str(website.url), owner_id=user.id)
     db.add(db_website)
     await db.commit()
     await db.refresh(db_website)
     return db_website
 
 @app.get("/websites", response_model=list[schemas.WebsiteOut])
-async def list_website(db:AsyncSession = Depends(get_db)):
+async def list_website(db:AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
+    stmt = select(model.Website).where(model.Website.owner_id == user.id)
     latest_check_subq = (
         select(
             model.Check.website_id,
@@ -158,3 +156,20 @@ async def get_history(website_id: int, db: AsyncSession = Depends(get_db)):
         .limit(50)
     )
     return result.scalars().all()
+
+@app.post("/register")
+async def register(email: str, password: str, db: AsyncSession = Depends(get_db)):
+    hashed = pwd_context.hash(password)
+    user = model.User(email=email, hashed_password=hashed)
+    db.add(user)
+    await db.commit()
+    return {"message": "registered"}
+
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(model.User).where(model.User.email == form_data.username))
+    user = result.scalar_one_or_none()
+    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+        raise HTTPException(401, "Incorrect email or password")
+    token = create_access_token(user.id)
+    return {"access_token": token, "token_type": "bearer"}

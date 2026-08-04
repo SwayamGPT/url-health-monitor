@@ -8,6 +8,10 @@ load_dotenv()
 
 database_url=os.getenv("sql_url")
 
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
 engine = create_async_engine (database_url)
 AsyncSessionLocal = sessionmaker (engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
