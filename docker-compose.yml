@@ -28,8 +28,7 @@ services:
       build:
         context: .
         dockerfile: Dockerfile
-        target: frontend-build
-
+        target: frontend
       container_name: url-monitor-frontend  
 
       ports:
@@ -40,7 +39,8 @@ services:
 
       depends_on:
         - backend
-
+        
+      restart: unless-stopped
   db:
     image: postgres:16
 
