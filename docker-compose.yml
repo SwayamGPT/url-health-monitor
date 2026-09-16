@@ -38,7 +38,7 @@ services:
         - .env
 
       environment:
-        VITE_API_URL: {VITE_API_URL}
+        VITE_API_URL: "${{VITE_API_URL}"
         
       depends_on:
         - backend
