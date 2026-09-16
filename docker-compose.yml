@@ -10,7 +10,7 @@ services:
     ports: "8080:8080"
 
     environment:
-      sql_url: {sql_url}
+      sql_url: postgresql+asyncpg://{postgres_user}:{postgres_password}@db:5432/{postgres_db}
       secret_key: {secret_key}
       algorithm: {algorithm}
 
