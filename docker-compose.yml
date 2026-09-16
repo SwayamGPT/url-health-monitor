@@ -28,7 +28,7 @@ services:
       build:
         context: .
         dockerfile: Dockerfile
-        target: frontend
+        target: frontend-build
 
       container_name: url-monitor-frontend  
 
