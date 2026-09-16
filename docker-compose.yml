@@ -39,9 +39,7 @@ services:
         - frontend/.env
 
       depends_on:
-      - backend
-
-      restart: unless-stopped
+        - backend
 
   db:
     image: postgres:16
