@@ -175,5 +175,5 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/health")
-    async def health():
+async def health():
     return {"ok": True}
