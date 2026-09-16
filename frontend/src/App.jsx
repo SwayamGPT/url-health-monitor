@@ -46,7 +46,7 @@ const handleAdd = async (e) => {
 return (
   <>
   <div style={{ padding: "2rem", fontFamily: "sans-serif"}}>
-    <h1>URL Health Monitor Version 1</h1>
+    <h1>URL Health Monitor</h1>
 
     <form onSubmit={handleAdd}>
       <input
