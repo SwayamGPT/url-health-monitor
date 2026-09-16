@@ -173,3 +173,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
         raise HTTPException(401, "Incorrect email or password")
     token = create_access_token(user.id)
     return {"access_token": token, "token_type": "bearer"}
+
+@app.get("/health")
+    async def health():
+    return {"ok": True}
