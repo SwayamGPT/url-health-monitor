@@ -34,3 +34,15 @@ RUN npm ci
 COPY frontend/ .
 
 RUN npm run build
+
+# =========================
+# Frontend Runtime
+# =========================
+
+FROM nginx:alpine AS frontend
+
+COPY --from=frontend-build /app/dist /usr/share/nginx/html
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
