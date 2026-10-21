@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import api, { errorMessage } from './api';
+import { AlertIcon, PulseIcon } from './icons';
 
 function AuthForm({ onLogin }) {
   const [mode, setMode] = useState('login');
@@ -7,6 +8,11 @@ function AuthForm({ onLogin }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
+  const switchMode = (m) => {
+    setMode(m);
+    setError('');
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -21,29 +27,59 @@ function AuthForm({ onLogin }) {
       onLogin();
     } catch (err) {
       setError(errorMessage(err, mode === 'login' ? 'Login failed' : 'Registration failed'));
-    } finally {
       setBusy(false);
     }
   };
 
   return (
-    <form className="card auth" onSubmit={handleSubmit}>
-      <h2>{mode === 'login' ? 'Log in' : 'Create account'}</h2>
-      <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" required />
-      <input
-        type="password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        placeholder="Password (min 8 characters)"
-        minLength={8}
-        required
-      />
-      <button type="submit" disabled={busy}>{mode === 'login' ? 'Log in' : 'Register'}</button>
-      {error && <p className="error">{error}</p>}
-      <button type="button" className="link" onClick={() => setMode(mode === 'login' ? 'register' : 'login')}>
-        {mode === 'login' ? 'Need an account? Register' : 'Have an account? Log in'}
-      </button>
-    </form>
+    <div className="auth-page">
+      <div className="auth-box">
+        <div className="brand">
+          <span className="brand-mark"><PulseIcon size={18} /></span>
+          URL Health Monitor
+        </div>
+        <p className="auth-tagline">Uptime monitoring with AI incident analysis.</p>
+
+        <form className="card auth-card" onSubmit={handleSubmit}>
+          <div className="tabs" role="tablist">
+            <button type="button" role="tab" aria-selected={mode === 'login'} className={`tab${mode === 'login' ? ' active' : ''}`} onClick={() => switchMode('login')}>
+              Log in
+            </button>
+            <button type="button" role="tab" aria-selected={mode === 'register'} className={`tab${mode === 'register' ? ' active' : ''}`} onClick={() => switchMode('register')}>
+              Create account
+            </button>
+          </div>
+
+          <label className="field">
+            Email
+            <input className="input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" required />
+          </label>
+          <label className="field">
+            Password
+            <input
+              className="input"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={mode === 'register' ? 'At least 8 characters' : '••••••••'}
+              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+              minLength={8}
+              required
+            />
+          </label>
+
+          {error && (
+            <div className="alert alert-error" role="alert">
+              <AlertIcon /> {error}
+            </div>
+          )}
+
+          <button type="submit" className="btn btn-primary" disabled={busy}>
+            {busy ? 'Please wait…' : mode === 'login' ? 'Log in' : 'Create account'}
+          </button>
+        </form>
+      </div>
+    </div>
   );
 }
 

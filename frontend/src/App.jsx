@@ -29,20 +29,8 @@ function App() {
     loadUser();
   }, [loadUser]);
 
-  return (
-    <main className="app">
-      {user === undefined ? (
-        <p className="muted">Loading…</p>
-      ) : user ? (
-        <Dashboard user={user} onLogout={handleLogout} />
-      ) : (
-        <>
-          <h1>URL Health Monitor</h1>
-          <AuthForm onLogin={loadUser} />
-        </>
-      )}
-    </main>
-  );
+  if (user === undefined) return <div className="loading">Loading…</div>;
+  return user ? <Dashboard user={user} onLogout={handleLogout} /> : <AuthForm onLogin={loadUser} />;
 }
 
 export default App;
