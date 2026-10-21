@@ -16,7 +16,9 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 |---|---|---|
 | API | FastAPI (async) | Native async support, automatic validation via Pydantic, auto-generated docs |
 | DB | PostgreSQL + SQLAlchemy (async) + asyncpg | Async driver keeps DB calls non-blocking inside async routes |
-| Auth | JWT in httpOnly cookie | Protects token from XSS (JS can't read it); `SameSite=Lax` mitigates CSRF |
+| Auth | Short-lived JWT + rotating refresh token, both in httpOnly cookies | Protects tokens from XSS (JS can't read them); `SameSite=Lax` mitigates CSRF; a leaked access token expires in 15 min |
+| Migrations | Alembic (async) | Versioned, reviewable schema changes instead of `create_all` |
+| Rate limiting | Redis (sliding window, Lua) | `/ask` limits hold across workers and replicas |
 | Frontend | React (Vite) | Component-based UI, fast dev server |
 | Concurrency (I/O) | `asyncio` + `httpx.AsyncClient` | Check many URLs concurrently — total time ≈ slowest single check, not the sum |
 | Concurrency (CPU) | `multiprocessing` via `run_in_executor` | Bulk HTML analysis is CPU-bound; sidesteps the GIL for real parallelism |
@@ -43,6 +45,7 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 
 ### Data model
 - `users` — id, email, hashed_password
+- `refresh_tokens` — id, user_id (FK → users), token_hash (sha256), created_at, expires_at, revoked_at
 - `websites` — id, url, owner_id (FK → users), created_at — unique per (owner_id, url)
 - `checks` — id, website_id (FK → websites, cascade delete), status_code, response_time_ms, is_up, error, checked_at, ai_summary, embedding (vector(384))
 
@@ -55,6 +58,10 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 **Why multiprocessing (not asyncio) for HTML analysis?** Text analysis is CPU-bound — actual computation, not waiting. Asyncio doesn't help with CPU-bound work due to the GIL; multiprocessing uses separate processes to get real parallelism. Fetching (I/O) and analyzing (CPU) are deliberately split between asyncio and multiprocessing, bridged via `run_in_executor` so the CPU-heavy work doesn't block the event loop.
 
 **Why JWT in an httpOnly cookie instead of localStorage?** localStorage is readable by JavaScript, so an XSS vulnerability could steal the token. An httpOnly cookie can't be read by JS at all. Trade-off: cookies are vulnerable to CSRF, mitigated with `SameSite=Lax`.
+
+**Why short-lived access tokens plus refresh tokens?** A JWT can't be revoked before it expires, so a long-lived one is a long-lived risk if it leaks. Access tokens now last 15 minutes; a 7-day opaque refresh token (stored only as a SHA-256 hash) gets a new pair from `/refresh`. Refresh tokens rotate on every use, and presenting an already-rotated token revokes all of that user's sessions, since that only happens if a token was copied. Logout revokes the refresh token server-side. The frontend's axios interceptor refreshes transparently on a 401 and shares one in-flight refresh across concurrent requests.
+
+**Why Redis for rate limiting?** An in-process counter is per worker: with 4 uvicorn workers a "10 per minute" limit is really 40. The limiter keeps a per-user sorted set of timestamps in Redis and checks-and-adds in one Lua script, so concurrent requests can't both slip under the limit. If `REDIS_URL` isn't set it falls back to the in-process window (fine for local dev); if Redis is down it logs and allows the request rather than taking `/ask` offline.
 
 **Why pgvector instead of a dedicated vector DB (Pinecone/FAISS)?** The vector data (check embeddings) lives naturally alongside the relational data it describes — one database, one connection pool, no extra service to run. A dedicated vector DB would make more sense for a large, standalone document corpus unrelated to relational records.
 
@@ -78,11 +85,14 @@ Frontend: http://localhost:3000 · API: http://localhost:8080 (docs at `/docs`).
 cd backend
 pip install -r requirements.txt
 docker run --name url-monitor-db -e POSTGRES_PASSWORD=pass -e POSTGRES_DB=urlmonitor -p 5432:5432 -d pgvector/pgvector:pg16
+alembic upgrade head          # create/upgrade the schema (also enables the vector extension)
 uvicorn main:app --reload
 ```
-The `vector` extension and tables are created on startup. The embedding model (~90 MB) is downloaded on first use; if it can't be loaded, monitoring keeps working and only `/ask` returns 503.
+Optionally run Redis (`docker run -p 6379:6379 -d redis:7-alpine`) and set `REDIS_URL` for shared rate limiting.
 
-> Upgrading an existing dev database: the schema changed (new `checks` table with `ai_summary`/`embedding`, per-user unique URLs). There are no migrations yet, so reset it: `docker compose down -v` (or drop the database).
+After changing `model.py`, generate a migration with `alembic revision --autogenerate -m "describe change"`, review it, and commit it. Docker runs `alembic upgrade head` automatically before starting the API. The embedding model (~90 MB) is downloaded on first use; if it can't be loaded, monitoring keeps working and only `/ask` returns 503.
+
+> Databases created before migrations were added (by the old `create_all` startup) don't match the initial migration. Reset them with `docker compose down -v` (or drop the database) and let `alembic upgrade head` build the schema.
 
 ### Frontend
 ```bash
@@ -98,15 +108,16 @@ DATABASE_URL=postgresql+asyncpg://postgres:pass@localhost:5432/urlmonitor
 SECRET_KEY=your-jwt-secret
 GROQ_API_KEY=your-groq-key   # or run Ollama locally instead
 ```
-Optional: `LLM_BASE_URL` / `LLM_MODEL` (defaults: Groq `llama-3.1-8b-instant`, or Ollama `llama3.1` at `http://localhost:11434/v1` when no Groq key is set — from inside Docker use `http://host.docker.internal:11434/v1`), `COOKIE_SECURE=true` behind HTTPS, `CORS_ORIGINS`, `CHECK_INTERVAL_SECONDS` (default 30), `ASK_RATE_LIMIT` (questions per user per minute, default 10).
+Optional: `LLM_BASE_URL` / `LLM_MODEL` (defaults: Groq `llama-3.1-8b-instant`, or Ollama `llama3.1` at `http://localhost:11434/v1` when no Groq key is set — from inside Docker use `http://host.docker.internal:11434/v1`), `COOKIE_SECURE=true` behind HTTPS, `CORS_ORIGINS`, `CHECK_INTERVAL_SECONDS` (default 30), `ASK_RATE_LIMIT` (questions per user per minute, default 10), `REDIS_URL`, `ACCESS_TOKEN_MINUTES` (default 15), `REFRESH_TOKEN_DAYS` (default 7).
 
 ## API endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | POST | `/register` | Create a user account |
-| POST | `/token` | Log in, sets auth cookie |
-| POST | `/logout` | Clears auth cookie |
+| POST | `/token` | Log in, sets access + refresh cookies |
+| POST | `/refresh` | Rotate the refresh token and issue a new access token |
+| POST | `/logout` | Revokes the refresh token and clears both cookies |
 | GET | `/me` | Current user (used by the frontend to restore a session) |
 | POST | `/websites` | Add a URL to monitor |
 | GET | `/websites` | List monitored URLs with latest status and AI summary (joined) |
@@ -119,9 +130,3 @@ Optional: `LLM_BASE_URL` / `LLM_MODEL` (defaults: Groq `llama-3.1-8b-instant`, o
 Background task: a scheduled loop re-checks all URLs every 30 seconds automatically via FastAPI's `lifespan` startup hook and `asyncio.create_task`.
 
 How `/ask` works: the question is embedded with the same local model, the 20 nearest check records (pgvector cosine distance, filtered to the caller's sites) are retrieved, and they're sent to the LLM together with per-site uptime stats so aggregate questions ("what's my uptime?") don't depend on retrieval alone.
-
-## Future improvements
-- Refresh tokens with short-lived access tokens
-- Alembic migrations instead of `create_all`
-- Shared (Redis) rate limiting so `/ask` limits hold across multiple workers
-

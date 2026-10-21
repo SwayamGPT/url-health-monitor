@@ -1,11 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException, Response
-from sqlalchemy import delete, func, select, text, case
+from sqlalchemy import delete, func, select, case
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from database import AsyncSessionLocal, engine, Base, get_db
+from database import AsyncSessionLocal, get_db
 import model, schemas, checker, analyzer, embeddings, llm
+from ratelimit import RateLimiter
 from datetime import datetime
-from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
 import httpx
@@ -15,7 +15,8 @@ import time
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from auth import get_current_user, pwd_context, create_access_token, set_auth_cookie, clear_auth_cookie
+import auth
+from auth import get_current_user, pwd_context
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("url-monitor")
@@ -23,6 +24,8 @@ log = logging.getLogger("url-monitor")
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 ASK_RATE_LIMIT = int(os.getenv("ASK_RATE_LIMIT", "10"))  # questions per user per minute
 ASK_TOP_K = 20
+
+ask_limiter = RateLimiter(os.getenv("REDIS_URL"), limit=ASK_RATE_LIMIT, window_seconds=60, prefix="ratelimit:ask")
 
 background_task = None
 process_pool: ProcessPoolExecutor | None = None
@@ -46,9 +49,8 @@ async def periodic_checker():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global background_task, process_pool
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await conn.run_sync(Base.metadata.create_all)
+    # Schema is managed by Alembic: run `alembic upgrade head` before starting the app.
+    log.info("/ask rate limiter backend: %s", ask_limiter.backend)
     process_pool = ProcessPoolExecutor()
     background_task = asyncio.create_task(periodic_checker())
     yield
@@ -58,6 +60,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     process_pool.shutdown(cancel_futures=True)
+    await ask_limiter.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -90,13 +93,21 @@ async def login(response: Response, form_data: OAuth2PasswordRequestForm = Depen
     user = result.scalar_one_or_none()
     if not user or not pwd_context.verify(form_data.password, user.hashed_password):
         raise HTTPException(401, "Incorrect email or password")
-    # The token only travels in the httpOnly cookie, never in the response body.
-    set_auth_cookie(response, create_access_token(user.id))
+    # Tokens only travel in httpOnly cookies, never in the response body.
+    await auth.issue_tokens(db, response, user.id)
+    await db.commit()
     return {"message": "logged in"}
 
+@app.post("/refresh")
+async def refresh(response: Response, refresh_token: str | None = Depends(auth.refresh_cookie_scheme), db: AsyncSession = Depends(get_db)):
+    await auth.rotate_refresh_token(db, response, refresh_token)
+    return {"message": "refreshed"}
+
 @app.post("/logout")
-async def logout(response: Response):
-    clear_auth_cookie(response)
+async def logout(response: Response, refresh_token: str | None = Depends(auth.refresh_cookie_scheme), db: AsyncSession = Depends(get_db)):
+    await auth.revoke_refresh_token(db, refresh_token)
+    await db.commit()
+    auth.clear_auth_cookies(response)
     return {"message": "logged out"}
 
 @app.get("/me", response_model=schemas.UserOut)
@@ -244,17 +255,14 @@ async def get_history(website_id: int, limit: int = 50, db: AsyncSession = Depen
 
 # ---------- RAG over monitoring history ----------
 
-_ask_calls: dict[int, deque] = defaultdict(deque)
-
-def enforce_ask_rate_limit(user: model.User = Depends(get_current_user)) -> model.User:
-    # In-memory sliding window; fine for a single process. Use Redis for multiple workers.
-    now = time.monotonic()
-    calls = _ask_calls[user.id]
-    while calls and now - calls[0] > 60:
-        calls.popleft()
-    if len(calls) >= ASK_RATE_LIMIT:
-        raise HTTPException(429, f"Rate limit: {ASK_RATE_LIMIT} questions per minute")
-    calls.append(now)
+async def enforce_ask_rate_limit(user: model.User = Depends(get_current_user)) -> model.User:
+    retry_after = await ask_limiter.hit(str(user.id))
+    if retry_after:
+        raise HTTPException(
+            429,
+            f"Rate limit: {ASK_RATE_LIMIT} questions per minute. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
     return user
 
 async def site_stats_context(db: AsyncSession, user: model.User) -> str:

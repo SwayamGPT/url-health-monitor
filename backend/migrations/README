@@ -1,0 +1,1 @@
+Alembic migrations (async). From backend/: `alembic upgrade head` to apply, `alembic revision --autogenerate -m "..."` after changing model.py.

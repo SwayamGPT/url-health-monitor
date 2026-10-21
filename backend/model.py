@@ -11,6 +11,7 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     websites = relationship("Website", back_populates="owner", passive_deletes=True)
+    refresh_tokens = relationship("RefreshToken", passive_deletes=True)
 
 class Website(Base):
     __tablename__ = "websites"
@@ -35,3 +36,14 @@ class Check(Base):
     ai_summary = Column(Text, nullable=True)
     embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
     website = relationship("Website", back_populates="checks")
+
+class RefreshToken(Base):
+    """Opaque refresh tokens, stored hashed so a DB leak doesn't hand out sessions.
+    Rotated on every use; presenting a revoked token revokes the whole family (reuse detection)."""
+    __tablename__ = "refresh_tokens"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash = Column(String(64), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
