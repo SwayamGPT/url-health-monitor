@@ -22,7 +22,7 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 | Frontend | React (Vite) | Component-based UI, fast dev server |
 | Concurrency (I/O) | `asyncio` + `httpx.AsyncClient` | Check many URLs concurrently — total time ≈ slowest single check, not the sum |
 | Concurrency (CPU) | `multiprocessing` via `run_in_executor` | Bulk HTML analysis is CPU-bound; sidesteps the GIL for real parallelism |
-| LLM | Groq (Llama 3.1, free tier) or local Ollama | Free/low-cost, OpenAI-compatible API, fast inference |
+| LLM | OpenRouter (Llama 3.1 8B by default) or local Ollama | One OpenAI-compatible API in front of many models, low cost, model is a config change |
 | Embeddings | `sentence-transformers` (local, `all-MiniLM-L6-v2`) | Free, fast, no per-call API cost for embedding thousands of check records |
 | Vector search | pgvector (Postgres extension) | Reuses existing Postgres instance — no separate vector DB service to run |
 
@@ -39,7 +39,7 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
             asyncio.gather        multiprocessing
             (URL health checks)   (HTML content analysis)
                     │
-              Groq / Ollama LLM
+        OpenRouter / Ollama LLM
          (incident summaries + RAG answers)
 ```
 
@@ -67,7 +67,7 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 
 **Why a local embedding model instead of an API for embeddings?** Every check record gets embedded — potentially thousands of rows. A local model (`all-MiniLM-L6-v2`) avoids per-call API cost and latency for something that doesn't need top-tier embedding quality.
 
-**Why a free/local LLM (Groq or Ollama) instead of a paid API?** Keeps the project runnable without billing setup. Groq offers fast inference on open models (Llama) with a usable free tier; Ollama runs fully locally with no API key, at the cost of depending on local hardware.
+**Why OpenRouter (or Ollama) instead of a single vendor's API?** OpenRouter puts hundreds of models (open and proprietary, including free `:free` variants) behind one OpenAI-compatible endpoint, so switching models is just `LLM_MODEL` and no code changes. The default, a small open Llama model, is cheap and plenty for two-sentence incident summaries. Ollama runs fully locally with no API key, at the cost of depending on local hardware.
 
 **Why only call the LLM on failed checks, not every check?** LLM calls cost time and (for hosted models) money. Gating the incident-summary call behind `if not is_up` avoids calling it on every healthy 30-second check. During an ongoing outage with the same status, the previous explanation is reused instead of asking again every cycle.
 
@@ -75,7 +75,7 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 
 ### Docker (everything)
 ```bash
-cp .env.example .env   # then set SECRET_KEY and GROQ_API_KEY
+cp .env.example .env   # then set SECRET_KEY and OPENROUTER_API_KEY
 docker compose up --build
 ```
 Frontend: http://localhost:3000 · API: http://localhost:8080 (docs at `/docs`).
@@ -106,9 +106,9 @@ See `.env.example`. The main ones:
 ```
 DATABASE_URL=postgresql+asyncpg://postgres:pass@localhost:5432/urlmonitor
 SECRET_KEY=your-jwt-secret
-GROQ_API_KEY=your-groq-key   # or run Ollama locally instead
+OPENROUTER_API_KEY=your-openrouter-key   # or run Ollama locally instead
 ```
-Optional: `LLM_BASE_URL` / `LLM_MODEL` (defaults: Groq `llama-3.1-8b-instant`, or Ollama `llama3.1` at `http://localhost:11434/v1` when no Groq key is set — from inside Docker use `http://host.docker.internal:11434/v1`), `COOKIE_SECURE=true` behind HTTPS, `CORS_ORIGINS`, `CHECK_INTERVAL_SECONDS` (default 30), `ASK_RATE_LIMIT` (questions per user per minute, default 10), `REDIS_URL`, `ACCESS_TOKEN_MINUTES` (default 15), `REFRESH_TOKEN_DAYS` (default 7).
+Optional: `LLM_BASE_URL` / `LLM_MODEL` (defaults: OpenRouter `meta-llama/llama-3.1-8b-instruct`, or Ollama `llama3.1` at `http://localhost:11434/v1` when no OpenRouter key is set — from inside Docker use `http://host.docker.internal:11434/v1`), `COOKIE_SECURE=true` behind HTTPS, `CORS_ORIGINS`, `CHECK_INTERVAL_SECONDS` (default 30), `ASK_RATE_LIMIT` (questions per user per minute, default 10), `REDIS_URL`, `ACCESS_TOKEN_MINUTES` (default 15), `REFRESH_TOKEN_DAYS` (default 7).
 
 ## API endpoints
 
