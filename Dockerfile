@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y \
 
 COPY backend/requirements.txt .
 
-RUN pip install --no-cache-dir -r requirements.txt
+# CPU-only torch for sentence-transformers; the default wheel pulls in GBs of CUDA libraries.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ .
 
@@ -32,6 +34,10 @@ COPY frontend/package*.json ./
 RUN npm ci
 
 COPY frontend/ .
+
+# Vite inlines VITE_* variables at build time, so the API URL must be a build arg.
+ARG VITE_API_URL
+ENV VITE_API_URL=$VITE_API_URL
 
 RUN npm run build
 

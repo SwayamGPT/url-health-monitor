@@ -43,8 +43,8 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 
 ### Data model
 - `users` — id, email, hashed_password
-- `websites` — id, url, owner_id (FK → users), created_at
-- `checks` — id, website_id (FK → websites), status_code, response_time_ms, is_up, checked_at, ai_summary, embedding (vector)
+- `websites` — id, url, owner_id (FK → users), created_at — unique per (owner_id, url)
+- `checks` — id, website_id (FK → websites, cascade delete), status_code, response_time_ms, is_up, error, checked_at, ai_summary, embedding (vector(384))
 
 ## Key design decisions
 
@@ -62,17 +62,27 @@ A full-stack concurrent website monitoring tool with AI-powered incident analysi
 
 **Why a free/local LLM (Groq or Ollama) instead of a paid API?** Keeps the project runnable without billing setup. Groq offers fast inference on open models (Llama) with a usable free tier; Ollama runs fully locally with no API key, at the cost of depending on local hardware.
 
-**Why only call the LLM on failed checks, not every check?** LLM calls cost time and (for hosted models) money. Gating the incident-summary call behind `if not is_up` avoids calling it on every healthy 30-second check.
+**Why only call the LLM on failed checks, not every check?** LLM calls cost time and (for hosted models) money. Gating the incident-summary call behind `if not is_up` avoids calling it on every healthy 30-second check. During an ongoing outage with the same status, the previous explanation is reused instead of asking again every cycle.
 
 ## Setup
+
+### Docker (everything)
+```bash
+cp .env.example .env   # then set SECRET_KEY and GROQ_API_KEY
+docker compose up --build
+```
+Frontend: http://localhost:3000 · API: http://localhost:8080 (docs at `/docs`).
 
 ### Backend
 ```bash
 cd backend
 pip install -r requirements.txt
-docker run --name url-monitor-db -e POSTGRES_PASSWORD=pass -e POSTGRES_DB=urlmonitor -p 5432:5432 -d postgres
+docker run --name url-monitor-db -e POSTGRES_PASSWORD=pass -e POSTGRES_DB=urlmonitor -p 5432:5432 -d pgvector/pgvector:pg16
 uvicorn main:app --reload
 ```
+The `vector` extension and tables are created on startup. The embedding model (~90 MB) is downloaded on first use; if it can't be loaded, monitoring keeps working and only `/ask` returns 503.
+
+> Upgrading an existing dev database: the schema changed (new `checks` table with `ai_summary`/`embedding`, per-user unique URLs). There are no migrations yet, so reset it: `docker compose down -v` (or drop the database).
 
 ### Frontend
 ```bash
@@ -82,11 +92,13 @@ npm run dev
 ```
 
 ### Environment variables
+See `.env.example`. The main ones:
 ```
 DATABASE_URL=postgresql+asyncpg://postgres:pass@localhost:5432/urlmonitor
 SECRET_KEY=your-jwt-secret
 GROQ_API_KEY=your-groq-key   # or run Ollama locally instead
 ```
+Optional: `LLM_BASE_URL` / `LLM_MODEL` (defaults: Groq `llama-3.1-8b-instant`, or Ollama `llama3.1` at `http://localhost:11434/v1` when no Groq key is set — from inside Docker use `http://host.docker.internal:11434/v1`), `COOKIE_SECURE=true` behind HTTPS, `CORS_ORIGINS`, `CHECK_INTERVAL_SECONDS` (default 30), `ASK_RATE_LIMIT` (questions per user per minute, default 10).
 
 ## API endpoints
 
@@ -95,14 +107,21 @@ GROQ_API_KEY=your-groq-key   # or run Ollama locally instead
 | POST | `/register` | Create a user account |
 | POST | `/token` | Log in, sets auth cookie |
 | POST | `/logout` | Clears auth cookie |
+| GET | `/me` | Current user (used by the frontend to restore a session) |
 | POST | `/websites` | Add a URL to monitor |
-| GET | `/websites` | List monitored URLs with latest status (joined) |
-| DELETE | `/websites` | Remove a monitored URL |
+| GET | `/websites` | List monitored URLs with latest status and AI summary (joined) |
+| DELETE | `/websites` | Remove a monitored URL (`{"url": ...}` body) and its history |
 | GET | `/websites/{id}/history` | Past check results for one URL |
 | POST | `/websites/check-all` | Manually trigger a concurrent check of all URLs |
 | POST | `/websites/analyze` | Bulk HTML analysis (multiprocessing) |
-| POST | `/ask` | Natural-language Q&A over monitoring history (RAG) |
+| POST | `/ask` | Natural-language Q&A over monitoring history (RAG), rate limited per user |
 
 Background task: a scheduled loop re-checks all URLs every 30 seconds automatically via FastAPI's `lifespan` startup hook and `asyncio.create_task`.
-ived access tokens
-- Rate limiting on `/ask` to control LLM call volume
+
+How `/ask` works: the question is embedded with the same local model, the 20 nearest check records (pgvector cosine distance, filtered to the caller's sites) are retrieved, and they're sent to the LLM together with per-site uptime stats so aggregate questions ("what's my uptime?") don't depend on retrieval alone.
+
+## Future improvements
+- Refresh tokens with short-lived access tokens
+- Alembic migrations instead of `create_all`
+- Shared (Redis) rate limiting so `/ask` limits hold across multiple workers
+

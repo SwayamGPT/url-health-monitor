@@ -1,18 +1,32 @@
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy import delete, func
+from fastapi import FastAPI, Depends, HTTPException, Response
+from sqlalchemy import delete, func, select, text, case
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
 from database import AsyncSessionLocal, engine, Base, get_db
-import model, schemas, checker, auth
+import model, schemas, checker, analyzer, embeddings, llm
 from datetime import datetime
-import time
+from collections import defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
 import asyncio
+import httpx
+import logging
+import os
+import time
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import oauth2, OAuth2PasswordRequestForm
-from auth import get_current_user, pwd_context, create_access_token
+from fastapi.security import OAuth2PasswordRequestForm
+from auth import get_current_user, pwd_context, create_access_token, set_auth_cookie, clear_auth_cookie
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("url-monitor")
+
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
+ASK_RATE_LIMIT = int(os.getenv("ASK_RATE_LIMIT", "10"))  # questions per user per minute
+ASK_TOP_K = 20
 
 background_task = None
+process_pool: ProcessPoolExecutor | None = None
+
 
 async def periodic_checker():
     while True:
@@ -21,28 +35,21 @@ async def periodic_checker():
                 result = await db.execute(select(model.Website))
                 websites = result.scalars().all()
                 if websites:
-                    check_result = await checker.concurrent_check_all_sequential([w.url for w in websites])
-                    for website, result_data in zip(websites, check_result):
-                        db.add(model.Check(
-                            website_id=website.id,
-                            status_code=result_data["status_code"],
-                            response_time_ms=result_data["response_time_ms"],
-                            is_up=result_data["is_up"],
-                            checked_at=datetime.utcnow(),
-                        ))
-                    await db.commit()
-                    print(f"Checked: {len(websites)}")
-        except Exception as e:
-            print(f"Background check failed: {e}")
+                    await checker.check_and_store(db, websites)
+                    log.info("Checked %d websites", len(websites))
+        except Exception:
+            log.exception("Background check failed")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global background_task, process_pool
     async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
-    global background_task
+    process_pool = ProcessPoolExecutor()
     background_task = asyncio.create_task(periodic_checker())
     yield
     background_task.cancel()
@@ -50,32 +57,82 @@ async def lifespan(app: FastAPI):
         await background_task
     except asyncio.CancelledError:
         pass
+    process_pool.shutdown(cancel_futures=True)
 
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(","),
+    allow_credentials=True,  # required for the auth cookie on cross-origin requests
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/websites", response_model= schemas.WebsiteOut)
+
+# ---------- auth ----------
+
+@app.post("/register", response_model=schemas.UserOut, status_code=201)
+async def register(user_in: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
+    user = model.User(email=user_in.email.lower(), hashed_password=pwd_context.hash(user_in.password))
+    db.add(user)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(400, "Email already registered")
+    await db.refresh(user)
+    return user
+
+@app.post("/token")
+async def login(response: Response, form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(model.User).where(model.User.email == form_data.username.lower()))
+    user = result.scalar_one_or_none()
+    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+        raise HTTPException(401, "Incorrect email or password")
+    # The token only travels in the httpOnly cookie, never in the response body.
+    set_auth_cookie(response, create_access_token(user.id))
+    return {"message": "logged in"}
+
+@app.post("/logout")
+async def logout(response: Response):
+    clear_auth_cookie(response)
+    return {"message": "logged out"}
+
+@app.get("/me", response_model=schemas.UserOut)
+async def me(user: model.User = Depends(get_current_user)):
+    return user
+
+
+# ---------- websites ----------
+
+async def get_owned_website(website_id: int, db: AsyncSession, user: model.User) -> model.Website:
+    result = await db.execute(
+        select(model.Website).where(model.Website.id == website_id, model.Website.owner_id == user.id)
+    )
+    website = result.scalar_one_or_none()
+    if not website:
+        raise HTTPException(404, "Website not found")
+    return website
+
+async def get_user_websites(db: AsyncSession, user: model.User) -> list[model.Website]:
+    result = await db.execute(select(model.Website).where(model.Website.owner_id == user.id))
+    return result.scalars().all()
+
+@app.post("/websites", response_model=schemas.WebsiteOut, status_code=201)
 async def add_website(website: schemas.WebsiteCreate, db: AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
-    result = await db.execute(select(model.Website).where(model.Website.url==str(website.url)))
-    existing = result.scalar_one_or_none()
-    if existing:
-        raise HTTPException(status_code=400, detail="Url already being monitored")
-    
     db_website = model.Website(url=str(website.url), owner_id=user.id)
     db.add(db_website)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(400, "URL already being monitored")
     await db.refresh(db_website)
     return db_website
 
 @app.get("/websites", response_model=list[schemas.WebsiteOut])
-async def list_website(db:AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
-    stmt = select(model.Website).where(model.Website.owner_id == user.id)
+async def list_websites(db: AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
     latest_check_subq = (
         select(
             model.Check.website_id,
@@ -92,6 +149,7 @@ async def list_website(db:AsyncSession = Depends(get_db), user: model.User = Dep
             model.Check.status_code,
             model.Check.response_time_ms,
             model.Check.checked_at,
+            model.Check.ai_summary,
         )
         .outerjoin(latest_check_subq, model.Website.id == latest_check_subq.c.website_id)
         .outerjoin(
@@ -99,6 +157,8 @@ async def list_website(db:AsyncSession = Depends(get_db), user: model.User = Dep
             (model.Check.website_id == latest_check_subq.c.website_id)
             & (model.Check.checked_at == latest_check_subq.c.max_checked_at)
         )
+        .where(model.Website.owner_id == user.id)
+        .order_by(model.Website.created_at)
     )
     result = await db.execute(stmt)
     rows = result.all()
@@ -112,67 +172,153 @@ async def list_website(db:AsyncSession = Depends(get_db), user: model.User = Dep
             "status_code": status_code,
             "response_time_ms": response_time_ms,
             "last_checked": checked_at,
+            "ai_summary": ai_summary,
         }
-        for w, is_up, status_code, response_time_ms, checked_at in rows
+        for w, is_up, status_code, response_time_ms, checked_at, ai_summary in rows
     ]
 
-@app.delete("/websites",response_model=schemas.WebsiteDelete)
-async def delete_website(website: schemas.WebsiteDelete, db:AsyncSession = Depends(get_db)):
-    stmt = delete(model.Website).where(model.Website.url==str(website.url))
+@app.delete("/websites")
+async def delete_website(website: schemas.WebsiteDelete, db: AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
+    stmt = delete(model.Website).where(
+        model.Website.url == str(website.url), model.Website.owner_id == user.id
+    )
     result = await db.execute(stmt)
 
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="URL not found.")
-    
+
     await db.commit()
-    return {"URL Succesfully deleted": result}
+    return {"deleted": str(website.url)}
 
-@app.get("/website/check-all")
-async def check_all_website(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(model.Website))
-    websites = result.scalars().all()
+@app.post("/websites/check-all")
+async def check_all_websites(db: AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
+    websites = await get_user_websites(db, user)
+    start = time.perf_counter()
+    checks = await checker.check_and_store(db, websites)
+    return {
+        "checked": len(checks),
+        "up": sum(c.is_up for c in checks),
+        "elapsed_ms": round((time.perf_counter() - start) * 1000),
+    }
 
-    check_result = await checker.concurrent_check_all_sequential([w.url for w in websites])
+@app.post("/websites/analyze", response_model=list[schemas.AnalysisOut])
+async def analyze_websites(db: AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
+    websites = await get_user_websites(db, user)
 
-    for website, result_data in zip(websites, check_result):
-        check = model.Check(
-            website_id=website.id,
-            status_code=result_data["status_code"],
-            response_time_ms=result_data["response_time_ms"],
-            is_up=result_data["is_up"],
-            checked_at=datetime.utcnow(),
-        )
-        db.add(check)
-    await db.commit()
-    return {"checked": len(websites)}
+    # I/O-bound: fetch every page concurrently.
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        fetched = await asyncio.gather(*(checker.fetch_html(client, w.url) for w in websites))
 
+    # CPU-bound: parse in worker processes so the event loop (and the GIL) aren't blocked.
+    loop = asyncio.get_running_loop()
+    jobs = [
+        loop.run_in_executor(process_pool, analyzer.analyze_html, html) if html is not None else None
+        for html, _ in fetched
+    ]
+    analyses = await asyncio.gather(*(j for j in jobs if j is not None), return_exceptions=True)
+    analyses_iter = iter(analyses)
 
-@app.get("/website/{website_id}/history", response_model=list[schemas.CheckOut])
-async def get_history(website_id: int, db: AsyncSession = Depends(get_db)):
+    out = []
+    for w, (html, error), job in zip(websites, fetched, jobs):
+        item = {"website_id": w.id, "url": w.url, "error": error}
+        if job is not None:
+            analysis = next(analyses_iter)
+            if isinstance(analysis, Exception):
+                item["error"] = f"Analysis failed: {analysis}"
+            else:
+                item.update(analysis)
+        out.append(item)
+    return out
+
+@app.get("/websites/{website_id}/history", response_model=list[schemas.CheckOut])
+async def get_history(website_id: int, limit: int = 50, db: AsyncSession = Depends(get_db), user: model.User = Depends(get_current_user)):
+    await get_owned_website(website_id, db, user)
     result = await db.execute(
         select(model.Check)
         .where(model.Check.website_id == website_id)
         .order_by(model.Check.checked_at.desc())
-        .limit(50)
+        .limit(min(max(limit, 1), 500))
     )
     return result.scalars().all()
 
-@app.post("/register")
-async def register(email: str, password: str, db: AsyncSession = Depends(get_db)):
-    hashed = pwd_context.hash(password)
-    user = model.User(email=email, hashed_password=hashed)
-    db.add(user)
-    await db.commit()
-    return {"message": "registered"}
 
-@app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(model.User).where(model.User.email == form_data.username))
-    user = result.scalar_one_or_none()
-    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
-        raise HTTPException(401, "Incorrect email or password")
-    token = create_access_token(user.id)
-    return {"access_token": token, "token_type": "bearer"}
+# ---------- RAG over monitoring history ----------
+
+_ask_calls: dict[int, deque] = defaultdict(deque)
+
+def enforce_ask_rate_limit(user: model.User = Depends(get_current_user)) -> model.User:
+    # In-memory sliding window; fine for a single process. Use Redis for multiple workers.
+    now = time.monotonic()
+    calls = _ask_calls[user.id]
+    while calls and now - calls[0] > 60:
+        calls.popleft()
+    if len(calls) >= ASK_RATE_LIMIT:
+        raise HTTPException(429, f"Rate limit: {ASK_RATE_LIMIT} questions per minute")
+    calls.append(now)
+    return user
+
+async def site_stats_context(db: AsyncSession, user: model.User) -> str:
+    stmt = (
+        select(
+            model.Website.url,
+            func.count(model.Check.id),
+            func.sum(case((model.Check.is_up, 1), else_=0)),
+            func.avg(model.Check.response_time_ms),
+            func.min(model.Check.checked_at),
+            func.max(case((model.Check.is_up == False, model.Check.checked_at))),  # noqa: E712
+        )
+        .outerjoin(model.Check, model.Check.website_id == model.Website.id)
+        .where(model.Website.owner_id == user.id)
+        .group_by(model.Website.id)
+    )
+    lines = []
+    for url, total, up, avg_ms, first, last_down in (await db.execute(stmt)).all():
+        if not total:
+            lines.append(f"- {url}: no checks yet")
+            continue
+        lines.append(
+            f"- {url}: {total} checks since {first:%Y-%m-%d %H:%M}, uptime {100 * (up or 0) / total:.1f}%, "
+            f"avg response {avg_ms or 0:.0f} ms, last down: {f'{last_down:%Y-%m-%d %H:%M}' if last_down else 'never'}"
+        )
+    return "\n".join(lines) or "(no monitored sites)"
+
+@app.post("/ask", response_model=schemas.AskResponse)
+async def ask(req: schemas.AskRequest, db: AsyncSession = Depends(get_db), user: model.User = Depends(enforce_ask_rate_limit)):
+    vectors = await embeddings.embed([req.question])
+    if not vectors:
+        raise HTTPException(503, "Embedding model unavailable")
+
+    # Nearest check records by cosine distance, restricted to this user's sites.
+    result = await db.execute(
+        select(model.Check, model.Website.url)
+        .join(model.Website, model.Check.website_id == model.Website.id)
+        .where(model.Website.owner_id == user.id, model.Check.embedding.is_not(None))
+        .order_by(model.Check.embedding.cosine_distance(vectors[0]))
+        .limit(ASK_TOP_K)
+    )
+    rows = result.all()
+    rows.sort(key=lambda r: r[0].checked_at)
+
+    context = (
+        f"Current time: {datetime.utcnow():%Y-%m-%d %H:%M} UTC\n\n"
+        f"Per-site stats:\n{await site_stats_context(db, user)}\n\n"
+        "Most relevant check records:\n"
+        + ("\n".join(f"- {embeddings.describe_check(url, c)}" for c, url in rows) or "(none)")
+    )
+    try:
+        answer = await llm.answer_question(req.question, context)
+    except llm.LLMError as e:
+        log.warning("LLM call failed for /ask: %s", e)
+        raise HTTPException(503, "LLM unavailable")
+
+    return {
+        "answer": answer,
+        "sources": [
+            {"check_id": c.id, "url": url, "checked_at": c.checked_at, "is_up": c.is_up, "status_code": c.status_code}
+            for c, url in rows
+        ],
+    }
+
 
 @app.get("/health")
 async def health():
